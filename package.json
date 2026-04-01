@@ -1,0 +1,27 @@
+{
+  "name": "mcp-ssh-remote",
+  "version": "1.0.0",
+  "description": "MCP server that wraps the system ssh binary — supports ProxyCommand, bastion hosts, and any ~/.ssh/config setup that Node's ssh2 library cannot handle",
+  "main": "index.js",
+  "bin": {
+    "mcp-ssh-remote": "index.js"
+  },
+  "author": "Jiecong Lin <jieconglin@outlook.com>",
+  "license": "MIT",
+  "keywords": ["mcp", "ssh", "claude", "remote", "bastion", "proxycommand", "mcp-server"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/JasonLinjc/mcp-ssh-remote.git"
+  },
+  "bugs": {
+    "url": "https://github.com/JasonLinjc/mcp-ssh-remote/issues"
+  },
+  "homepage": "https://github.com/JasonLinjc/mcp-ssh-remote#readme",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {}
+}
