@@ -2,16 +2,26 @@
 
 An MCP (Model Context Protocol) server that wraps the **system `ssh` binary** to execute commands on remote hosts — with full support for `ProxyCommand`, bastion hosts, jump hosts, and any configuration in `~/.ssh/config`.
 
+Built for workflows where your GPU/HPC server is behind a bastion host, has no internet access, and you want to develop locally with Claude Code while running jobs remotely.
+
 ## Why this exists
 
 Most SSH-based MCP servers (e.g. `@fangjunjie/ssh-mcp-server`) use Node's `ssh2` library internally, which **does not support `ProxyCommand`**. If your remote server is behind a bastion host or requires a custom proxy setup defined in `~/.ssh/config`, those servers simply cannot connect.
 
 This server has no SSH implementation of its own — it calls the system `ssh` binary directly, so it inherits everything your shell SSH already supports: `ProxyCommand`, `ProxyJump`, identity files, `ControlMaster`, port forwarding, and so on.
 
+## Features
+
+- **SSH ControlMaster multiplexing** — opens one persistent connection on startup, all commands reuse it (no per-command bastion handshake overhead)
+- **Login shell wrapping** — commands run via `bash -l` so your full environment (conda, Slurm, modules) is always available
+- **Slurm integration** — submit, cancel, monitor jobs and read logs directly
+- **rsync support** — sync local directories to the remote server through the bastion
+- **Safe file operations** — large file writes piped via stdin (no shell arg limits), edit files with find-and-replace
+
 ## Requirements
 
-- Node.js ≥ 14
-- System `ssh` installed and configured (openssh)
+- Node.js >= 14
+- System `ssh` and `rsync` installed (openssh)
 - The target host must be reachable via `ssh <hostname>` from your terminal
 
 ## Installation
@@ -77,12 +87,56 @@ Then just pass `--host myserver` — the ProxyCommand is followed automatically.
 
 ## Tools
 
+### File Operations
+
 | Tool | Description |
 |---|---|
-| `execute_command` | Run any shell command on the remote host |
-| `read_file` | Read a remote file's contents |
-| `write_file` | Write text content to a remote file |
+| `execute_command` | Run any shell command (configurable timeout, up to 10 min) |
+| `read_file` | Read a remote file (supports `offset` and `limit` for large files) |
+| `write_file` | Write content to a remote file (creates parent dirs, handles large files) |
+| `edit_file` | Find-and-replace a unique string in a remote file |
 | `list_directory` | List files in a remote directory (`ls -la`) |
+| `grep_files` | Search file contents with regex (recursive, with file filtering) |
+| `glob_files` | Find files by glob pattern |
+
+### Slurm Job Management
+
+| Tool | Description |
+|---|---|
+| `slurm_status` | Show job queue (current user or all users) |
+| `slurm_submit` | Submit a batch job (from script path or inline script content) |
+| `slurm_cancel` | Cancel a job by ID |
+| `slurm_job_info` | Get detailed job info (`scontrol show job`) |
+| `slurm_log` | Tail stdout/stderr logs of a running or completed job |
+
+### Sync
+
+| Tool | Description |
+|---|---|
+| `rsync_to_remote` | Rsync a local directory to the remote host (with exclude patterns, dry-run, delete) |
+| `git_pull_remote` | Pull latest git changes in a remote directory |
+
+## Typical Workflow
+
+```
+1. Edit code locally           →  Claude Code's native Edit/Write tools
+2. Sync to remote              →  rsync_to_remote (quick) or git push + git_pull_remote (committed)
+3. Submit a Slurm job          →  slurm_submit
+4. Monitor training            →  slurm_status + slurm_log
+5. Read results                →  read_file, grep_files
+```
+
+Example conversation:
+```
+You:    "Change the learning rate to 1e-4 in train.py"
+Claude: [edits local file]
+
+You:    "Sync and submit on gpu31 with 4 GPUs"
+Claude: [rsync_to_remote] → [slurm_submit -p gpu31 --gres=gpu:4]
+
+You:    "How's it going?"
+Claude: [slurm_status] → [slurm_log]
+```
 
 ## Usage
 

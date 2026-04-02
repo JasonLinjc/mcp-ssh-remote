@@ -1,7 +1,7 @@
 {
   "name": "mcp-ssh-remote",
-  "version": "1.0.0",
-  "description": "MCP server that wraps the system ssh binary — supports ProxyCommand, bastion hosts, and any ~/.ssh/config setup that Node's ssh2 library cannot handle",
+  "version": "2.0.0",
+  "description": "MCP server that wraps the system ssh binary — supports ProxyCommand, bastion hosts, Slurm job management, rsync, and any ~/.ssh/config setup",
   "main": "index.js",
   "bin": {
     "mcp-ssh-remote": "index.js"
