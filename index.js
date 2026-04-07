@@ -300,12 +300,12 @@ const TOOLS = [
   // --- Sync tools ---
   {
     name: 'rsync_to_remote',
-    description: `Rsync a local directory to ${HOST}. Uses the same SSH connection (bastion-aware).`,
+    description: `Rsync a local file or directory to ${HOST}. Uses the same SSH connection (bastion-aware).`,
     inputSchema: {
       type: 'object',
       properties: {
-        local_path: { type: 'string', description: 'Local directory to sync from' },
-        remote_path: { type: 'string', description: 'Remote directory to sync to' },
+        local_path: { type: 'string', description: 'Local file or directory to sync from' },
+        remote_path: { type: 'string', description: 'Remote file or directory to sync to' },
         exclude: { type: 'array', items: { type: 'string' }, description: 'Patterns to exclude (e.g. ["__pycache__", ".git", "*.pyc", "wandb"])' },
         dry_run: { type: 'boolean', description: 'Preview changes without syncing (default false)' },
         delete: { type: 'boolean', description: 'Delete remote files not present locally (default false)' }
@@ -327,12 +327,12 @@ const TOOLS = [
   },
   {
     name: 'rsync_from_remote',
-    description: `Rsync a remote directory from ${HOST} to local. Uses the same SSH connection (bastion-aware).`,
+    description: `Rsync a remote file or directory from ${HOST} to local. Uses the same SSH connection (bastion-aware).`,
     inputSchema: {
       type: 'object',
       properties: {
-        remote_path: { type: 'string', description: 'Remote directory to sync from' },
-        local_path: { type: 'string', description: 'Local directory to sync to' },
+        remote_path: { type: 'string', description: 'Remote file or directory to sync from (files auto-detected by extension)' },
+        local_path: { type: 'string', description: 'Local file or directory to sync to' },
         exclude: { type: 'array', items: { type: 'string' }, description: 'Patterns to exclude (e.g. ["__pycache__", ".git", "*.pyc"])' },
         dry_run: { type: 'boolean', description: 'Preview changes without syncing (default false)' },
         delete: { type: 'boolean', description: 'Delete local files not present on remote (default false)' }
@@ -584,7 +584,11 @@ print('OK')
 
   // --- rsync_to_remote ---
   if (name === 'rsync_to_remote') {
-    const localPath = args.local_path.endsWith('/') ? args.local_path : args.local_path + '/';
+    // Detect if local_path is a file (don't append '/' for files)
+    let localIsFile = false;
+    try { localIsFile = fs.statSync(args.local_path).isFile(); } catch {}
+    const localPath = localIsFile ? args.local_path : (args.local_path.endsWith('/') ? args.local_path : args.local_path + '/');
+    // For file-to-file sync, remote_path is the destination file path (no trailing slash)
     const remoteDest = `${HOST}:${args.remote_path}`;
 
     const rsyncArgs = [
@@ -628,8 +632,11 @@ print('OK')
 
   // --- rsync_from_remote ---
   if (name === 'rsync_from_remote') {
-    const remoteSrc = `${HOST}:${args.remote_path.endsWith('/') ? args.remote_path : args.remote_path + '/'}`;
-    const localDest = args.local_path.endsWith('/') ? args.local_path : args.local_path + '/';
+    // Detect if remote_path looks like a file (no trailing slash, has an extension)
+    // For directory sync, append '/'; for file sync, keep path as-is
+    const remoteIsFile = !args.remote_path.endsWith('/') && /\.[^/]+$/.test(args.remote_path);
+    const remoteSrc = remoteIsFile ? `${HOST}:${args.remote_path}` : `${HOST}:${args.remote_path.endsWith('/') ? args.remote_path : args.remote_path + '/'}`;
+    const localDest = remoteIsFile ? args.local_path : (args.local_path.endsWith('/') ? args.local_path : args.local_path + '/');
 
     const rsyncArgs = [
       '-avz',
