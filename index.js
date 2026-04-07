@@ -20,7 +20,7 @@ if (!HOST) {
 // --- SSH ControlMaster multiplexing ---
 const CONTROL_DIR = path.join(os.tmpdir(), 'mcp-ssh-remote');
 const CONTROL_PATH = path.join(CONTROL_DIR, `ctrl-${HOST}`);
-const SSH_TIMEOUT = 30;
+const SSH_TIMEOUT = 60;
 const LONG_TIMEOUT = 600; // 10 minutes for long-running commands
 
 try { fs.mkdirSync(CONTROL_DIR, { recursive: true, mode: 0o700 }); } catch {}
@@ -40,7 +40,7 @@ function startControlMaster() {
     '-o', `ConnectTimeout=${SSH_TIMEOUT}`,
     '-o', 'ControlMaster=yes',
     '-o', `ControlPath=${CONTROL_PATH}`,
-    '-o', 'ControlPersist=600',
+    '-o', 'ControlPersist=3600',
     '-o', 'ServerAliveInterval=30',
     '-o', 'ServerAliveCountMax=3',
     '-N', '-f',
@@ -73,11 +73,36 @@ function sshArgs() {
   ];
 }
 
+function ensureConnection() {
+  const check = spawnSync('ssh', ['-O', 'check', '-o', `ControlPath=${CONTROL_PATH}`, HOST],
+    { encoding: 'utf8', timeout: 5000 });
+  if (check.status !== 0) {
+    process.stderr.write('ControlMaster dead, reconnecting...\n');
+    startControlMaster();
+  }
+}
+
 function ssh(remoteCmd, timeout = SSH_TIMEOUT) {
+  ensureConnection();
   // Wrap in login shell so ~/.bashrc / /etc/profile.d are sourced (Slurm, conda, etc.)
   const wrappedCmd = `bash -l -c ${shellQuote(remoteCmd)}`;
   const result = spawnSync('ssh', [...sshArgs(), wrappedCmd],
     { encoding: 'utf8', timeout: (timeout + 5) * 1000 });
+
+  // Retry once on timeout — ControlMaster may have dropped mid-flight
+  if (result.error?.code === 'ETIMEDOUT') {
+    process.stderr.write('SSH timed out, retrying after reconnect...\n');
+    startControlMaster();
+    const retry = spawnSync('ssh', [...sshArgs(), wrappedCmd],
+      { encoding: 'utf8', timeout: (timeout + 5) * 1000 });
+    return {
+      stdout: retry.stdout ?? '',
+      stderr: retry.stderr ?? '',
+      status: retry.status ?? -1,
+      error: retry.error?.message ?? null
+    };
+  }
+
   return {
     stdout: result.stdout ?? '',
     stderr: result.stderr ?? '',
@@ -92,6 +117,7 @@ function shellQuote(s) {
 
 // Pipe content via stdin to avoid ARG_MAX limits
 function sshWithStdin(remoteCmd, stdinData, timeout = SSH_TIMEOUT) {
+  ensureConnection();
   const wrappedCmd = `bash -l -c ${shellQuote(remoteCmd)}`;
   const result = spawnSync('ssh', [...sshArgs(), wrappedCmd], {
     input: stdinData,
@@ -297,6 +323,69 @@ const TOOLS = [
         branch: { type: 'string', description: 'Branch to pull (default: current)' }
       },
       required: ['path']
+    }
+  },
+  {
+    name: 'rsync_from_remote',
+    description: `Rsync a remote directory from ${HOST} to local. Uses the same SSH connection (bastion-aware).`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        remote_path: { type: 'string', description: 'Remote directory to sync from' },
+        local_path: { type: 'string', description: 'Local directory to sync to' },
+        exclude: { type: 'array', items: { type: 'string' }, description: 'Patterns to exclude (e.g. ["__pycache__", ".git", "*.pyc"])' },
+        dry_run: { type: 'boolean', description: 'Preview changes without syncing (default false)' },
+        delete: { type: 'boolean', description: 'Delete local files not present on remote (default false)' }
+      },
+      required: ['remote_path', 'local_path']
+    }
+  },
+  {
+    name: 'slurm_array_summary',
+    description: `Get a concise summary of a Slurm array job on ${HOST}: completed/running/pending/failed counts, failed task IDs, and elapsed times.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        job_id: { type: 'string', description: 'Slurm array job ID (e.g. "12345678")' }
+      },
+      required: ['job_id']
+    }
+  },
+  {
+    name: 'tail_file',
+    description: `Read the last N lines of a file on ${HOST}. Useful for monitoring growing log files.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute path to the remote file' },
+        lines: { type: 'number', description: 'Number of lines from the end (default 50)' }
+      },
+      required: ['path']
+    }
+  },
+  {
+    name: 'disk_usage',
+    description: `Check disk usage of a file or directory on ${HOST}. Returns human-readable sizes.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute path to file or directory' },
+        max_depth: { type: 'number', description: 'Max directory depth to report (default: top-level summary only)' }
+      },
+      required: ['path']
+    }
+  },
+  {
+    name: 'slurm_resubmit_failed',
+    description: `Identify failed tasks in a Slurm array job on ${HOST} and resubmit only those tasks. Returns the new job ID.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        job_id: { type: 'string', description: 'Original Slurm array job ID' },
+        script_path: { type: 'string', description: 'Path to the original .slurm script to resubmit' },
+        extra_args: { type: 'string', description: 'Additional sbatch arguments for the resubmission' }
+      },
+      required: ['job_id', 'script_path']
     }
   }
 ];
@@ -537,6 +626,169 @@ print('OK')
     return { content: [{ type: 'text', text: r.stdout + (r.stderr ? `\n${r.stderr}` : '') }] };
   }
 
+  // --- rsync_from_remote ---
+  if (name === 'rsync_from_remote') {
+    const remoteSrc = `${HOST}:${args.remote_path.endsWith('/') ? args.remote_path : args.remote_path + '/'}`;
+    const localDest = args.local_path.endsWith('/') ? args.local_path : args.local_path + '/';
+
+    const rsyncArgs = [
+      '-avz',
+      '-e', `ssh -o BatchMode=yes -o ConnectTimeout=${SSH_TIMEOUT} -o ControlPath=${CONTROL_PATH} -o ControlMaster=auto`
+    ];
+
+    if (args.dry_run) rsyncArgs.push('--dry-run');
+    if (args.delete) rsyncArgs.push('--delete');
+    if (args.exclude) {
+      for (const pattern of args.exclude) {
+        rsyncArgs.push('--exclude', pattern);
+      }
+    }
+    rsyncArgs.push(remoteSrc, localDest);
+
+    const result = spawnSync('rsync', rsyncArgs, {
+      encoding: 'utf8',
+      timeout: LONG_TIMEOUT * 1000,
+      maxBuffer: 50 * 1024 * 1024
+    });
+
+    if (result.error)
+      return { content: [{ type: 'text', text: `Error: ${result.error.message}` }], isError: true };
+    if (result.status !== 0)
+      return { content: [{ type: 'text', text: `rsync failed (exit ${result.status}):\n${result.stderr}` }], isError: true };
+
+    const prefix = args.dry_run ? '[DRY RUN] ' : '';
+    return { content: [{ type: 'text', text: `${prefix}Synced ${HOST}:${args.remote_path} → ${args.local_path}\n${result.stdout}` }] };
+  }
+
+  // --- slurm_array_summary ---
+  if (name === 'slurm_array_summary') {
+    const jobId = args.job_id;
+    // Get per-task status via sacct (works for running and completed jobs)
+    const r = ssh(`sacct -j ${jobId} --format=JobID%30,State%20,ExitCode%10,Elapsed%12,NodeList%15 --noheader --parsable2 2>&1`, 30);
+    if (r.error)
+      return { content: [{ type: 'text', text: `Error: ${r.error}` }], isError: true };
+
+    const lines = r.stdout.trim().split('\n').filter(l => l.trim());
+    // Parse only array task lines (e.g. "12345_1") — skip .batch/.extern sub-steps
+    const tasks = [];
+    for (const line of lines) {
+      const parts = line.split('|');
+      if (parts.length < 5) continue;
+      const id = parts[0].trim();
+      // Match "JOBID_TASKID" but not "JOBID_TASKID.batch" or "JOBID_TASKID.extern"
+      if (!id.includes('_') || id.includes('.')) continue;
+      const taskMatch = id.match(/_(\d+)$/);
+      if (!taskMatch) continue;
+      tasks.push({
+        taskId: parseInt(taskMatch[1], 10),
+        state: parts[1].trim(),
+        exitCode: parts[2].trim(),
+        elapsed: parts[3].trim(),
+        node: parts[4].trim()
+      });
+    }
+
+    if (tasks.length === 0) {
+      // Fallback: maybe it's still pending as a batch, check squeue
+      const sq = ssh(`squeue -j ${jobId} -o "%.10i %.2t %.12M %R" --noheader 2>&1`, 15);
+      return { content: [{ type: 'text', text: `No completed/running task data from sacct.\nsqueue:\n${sq.stdout || '(no output)'}` }] };
+    }
+
+    // Tally states
+    const counts = {};
+    const failed = [];
+    for (const t of tasks) {
+      const s = t.state.replace(/\s+/g, '');
+      counts[s] = (counts[s] || 0) + 1;
+      if (s === 'FAILED' || s === 'TIMEOUT' || s === 'OUT_OF_MEMORY' || s === 'CANCELLED')
+        failed.push(t);
+    }
+
+    // Elapsed time range
+    const elapsedVals = tasks.filter(t => t.elapsed && t.elapsed !== '').map(t => t.elapsed);
+
+    let summary = `Array job ${jobId}: ${tasks.length} tasks\n`;
+    summary += `\nStatus breakdown:\n`;
+    for (const [state, count] of Object.entries(counts).sort()) {
+      summary += `  ${state}: ${count}\n`;
+    }
+
+    if (elapsedVals.length > 0) {
+      elapsedVals.sort();
+      summary += `\nElapsed: ${elapsedVals[0]} — ${elapsedVals[elapsedVals.length - 1]}\n`;
+    }
+
+    if (failed.length > 0) {
+      summary += `\nFailed/problematic tasks:\n`;
+      for (const t of failed) {
+        summary += `  task ${t.taskId}: ${t.state} (exit ${t.exitCode}) elapsed ${t.elapsed} node ${t.node}\n`;
+      }
+      summary += `\nFailed task IDs: ${failed.map(t => t.taskId).join(',')}\n`;
+    }
+
+    return { content: [{ type: 'text', text: summary }] };
+  }
+
+  // --- tail_file ---
+  if (name === 'tail_file') {
+    const sp = safePath(args.path);
+    const lines = args.lines || 50;
+    const r = ssh(`tail -n ${lines} '${sp}' 2>&1`, 60);
+    if (r.error || r.status !== 0)
+      return { content: [{ type: 'text', text: `Error reading file: ${r.stderr || r.error}` }], isError: true };
+    return { content: [{ type: 'text', text: r.stdout }] };
+  }
+
+  // --- disk_usage ---
+  if (name === 'disk_usage') {
+    const sp = safePath(args.path);
+    let cmd;
+    if (args.max_depth != null) {
+      cmd = `du -h --max-depth=${args.max_depth} '${sp}' 2>&1`;
+    } else {
+      cmd = `du -sh '${sp}' 2>&1`;
+    }
+    const r = ssh(cmd, 60);
+    if (r.error || r.status !== 0)
+      return { content: [{ type: 'text', text: `Error: ${r.stderr || r.error}` }], isError: true };
+    return { content: [{ type: 'text', text: r.stdout }] };
+  }
+
+  // --- slurm_resubmit_failed ---
+  if (name === 'slurm_resubmit_failed') {
+    const jobId = args.job_id;
+    // Get failed task IDs via sacct
+    const r = ssh(`sacct -j ${jobId} --format=JobID%30,State%20 --noheader --parsable2 2>&1`, 30);
+    if (r.error)
+      return { content: [{ type: 'text', text: `Error: ${r.error}` }], isError: true };
+
+    const lines = r.stdout.trim().split('\n').filter(l => l.trim());
+    const failedIds = [];
+    for (const line of lines) {
+      const parts = line.split('|');
+      if (parts.length < 2) continue;
+      const id = parts[0].trim();
+      const state = parts[1].trim().replace(/\s+/g, '');
+      if (!id.includes('_') || id.includes('.')) continue;
+      const taskMatch = id.match(/_(\d+)$/);
+      if (!taskMatch) continue;
+      if (state === 'FAILED' || state === 'TIMEOUT' || state === 'OUT_OF_MEMORY' || state === 'CANCELLED')
+        failedIds.push(parseInt(taskMatch[1], 10));
+    }
+
+    if (failedIds.length === 0)
+      return { content: [{ type: 'text', text: `No failed tasks found in job ${jobId}. Nothing to resubmit.` }] };
+
+    const arraySpec = failedIds.sort((a, b) => a - b).join(',');
+    const sp = safePath(args.script_path);
+    const extra = args.extra_args ? ` ${args.extra_args}` : '';
+    const submitR = ssh(`sbatch --array=${arraySpec}${extra} '${sp}' 2>&1`, 30);
+    if (submitR.error)
+      return { content: [{ type: 'text', text: `Error submitting: ${submitR.error}` }], isError: true };
+
+    return { content: [{ type: 'text', text: `Resubmitting ${failedIds.length} failed tasks: ${arraySpec}\n${submitR.stdout}` }] };
+  }
+
   return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true };
 }
 
@@ -547,7 +799,7 @@ function dispatch(msg) {
     return respond(id, {
       protocolVersion: '2024-11-05',
       capabilities: { tools: {} },
-      serverInfo: { name: 'mcp-ssh-remote', version: '2.0.0' }
+      serverInfo: { name: 'mcp-ssh-remote', version: '2.2.0' }
     });
   }
 

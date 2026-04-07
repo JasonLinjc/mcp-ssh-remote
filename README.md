@@ -108,13 +108,18 @@ Then just pass `--host myserver` — the ProxyCommand is followed automatically.
 | `slurm_cancel` | Cancel a job by ID |
 | `slurm_job_info` | Get detailed job info (`scontrol show job`) |
 | `slurm_log` | Tail stdout/stderr logs of a running or completed job |
+| `slurm_array_summary` | Concise summary of an array job: completed/running/pending/failed counts, failed task IDs |
+| `slurm_resubmit_failed` | Identify failed tasks in an array job and resubmit only those |
 
-### Sync
+### Sync & Utilities
 
 | Tool | Description |
 |---|---|
 | `rsync_to_remote` | Rsync a local directory to the remote host (with exclude patterns, dry-run, delete) |
+| `rsync_from_remote` | Rsync a remote directory to local (pull results back) |
 | `git_pull_remote` | Pull latest git changes in a remote directory |
+| `tail_file` | Read the last N lines of a remote file (useful for monitoring logs) |
+| `disk_usage` | Check disk usage of a file or directory (with optional depth) |
 
 ## Typical Workflow
 
