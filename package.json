@@ -1,6 +1,6 @@
 {
   "name": "mcp-ssh-remote",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "description": "MCP server that wraps the system ssh binary — supports ProxyCommand, bastion hosts, Slurm job management, rsync, and any ~/.ssh/config setup",
   "main": "index.js",
   "bin": {

@@ -376,6 +376,24 @@ const TOOLS = [
     }
   },
   {
+    name: 'run_python',
+    description: `Run a Python script on ${HOST} via a quick Slurm job. Automatically handles conda activation, submits the job, polls until completion, and returns stdout/stderr. Ideal for data analysis tasks that need packages (pandas, scipy, etc.) without SSH timeout issues.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        code: { type: 'string', description: 'Python code to execute' },
+        conda_env: { type: 'string', description: 'Conda environment to activate (default: jc_py311)' },
+        partition: { type: 'string', description: 'Slurm partition (default: gpu31)' },
+        working_dir: { type: 'string', description: 'Working directory for the script (default: home dir)' },
+        timeout: { type: 'number', description: 'Max seconds to wait for job completion (default: 300)' },
+        mem: { type: 'string', description: 'Memory allocation (default: 8G)' },
+        cpus: { type: 'number', description: 'Number of CPUs (default: 2)' },
+        time_limit: { type: 'string', description: 'Slurm time limit (default: 0:10:00)' }
+      },
+      required: ['code']
+    }
+  },
+  {
     name: 'slurm_resubmit_failed',
     description: `Identify failed tasks in a Slurm array job on ${HOST} and resubmit only those tasks. Returns the new job ID.`,
     inputSchema: {
@@ -759,6 +777,86 @@ print('OK')
     if (r.error || r.status !== 0)
       return { content: [{ type: 'text', text: `Error: ${r.stderr || r.error}` }], isError: true };
     return { content: [{ type: 'text', text: r.stdout }] };
+  }
+
+  // --- run_python ---
+  if (name === 'run_python') {
+    const condaEnv = args.conda_env || 'jc_py311';
+    const partition = args.partition || 'gpu31';
+    const workDir = args.working_dir || '';
+    const maxWait = Math.min(args.timeout || 300, 600);
+    const mem = args.mem || '8G';
+    const cpus = args.cpus || 2;
+    const timeLimit = args.time_limit || '0:10:00';
+
+    const ts = Date.now();
+    const pyPath = `/tmp/mcp_py_${ts}.py`;
+    const outPath = `/tmp/mcp_py_${ts}.out`;
+    const errPath = `/tmp/mcp_py_${ts}.err`;
+
+    // Write Python code to temp file
+    const writeR = sshWithStdin(`cat > '${pyPath}'`, args.code, 15);
+    if (writeR.error || writeR.status !== 0)
+      return { content: [{ type: 'text', text: `Error writing script: ${writeR.stderr || writeR.error}` }], isError: true };
+
+    // Build and write the Slurm wrapper script
+    const cdLine = workDir ? `cd '${safePath(workDir)}'` : '';
+    const slurmScript = `#!/bin/bash
+#SBATCH --job-name=mcp_py
+#SBATCH --output=${outPath}
+#SBATCH --error=${errPath}
+#SBATCH --nodes=1 --ntasks=1 --cpus-per-task=${cpus} --mem=${mem}
+#SBATCH --time=${timeLimit}
+#SBATCH -p ${partition}
+${cdLine}
+source /lustre/grp/zyjlab/linjc/miniconda3/etc/profile.d/conda.sh
+conda activate ${condaEnv}
+python3 '${pyPath}'
+`;
+    const scriptPath = `/tmp/mcp_py_${ts}.sh`;
+    const writeS = sshWithStdin(`cat > '${scriptPath}' && chmod +x '${scriptPath}'`, slurmScript, 15);
+    if (writeS.error || writeS.status !== 0)
+      return { content: [{ type: 'text', text: `Error writing Slurm script: ${writeS.stderr || writeS.error}` }], isError: true };
+
+    // Submit
+    const subR = ssh(`sbatch '${scriptPath}' 2>&1`, 30);
+    if (subR.error || !subR.stdout.includes('Submitted'))
+      return { content: [{ type: 'text', text: `Submission failed: ${subR.stdout || ''} ${subR.stderr || subR.error || ''}` }], isError: true };
+
+    const jobId = subR.stdout.match(/Submitted batch job (\d+)/)?.[1];
+    if (!jobId)
+      return { content: [{ type: 'text', text: `Could not parse job ID: ${subR.stdout}` }], isError: true };
+
+    // Poll until completion
+    const startTime = Date.now();
+    let state = 'PENDING';
+
+    while (Date.now() - startTime < maxWait * 1000) {
+      const stateR = ssh(`sacct -j ${jobId} --format=State%20 --noheader --parsable2 2>&1 | head -1`, 15);
+      if (stateR.stdout) {
+        state = stateR.stdout.trim();
+        if (['COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY', 'NODE_FAIL'].includes(state)) break;
+      }
+      // Sleep via shell to avoid Node blocking issues
+      spawnSync('sleep', ['3'], { timeout: 5000 });
+    }
+
+    // Read output
+    const outR = ssh(`cat '${outPath}' 2>/dev/null`, 30);
+    const errR = ssh(`cat '${errPath}' 2>/dev/null`, 30);
+
+    // Cleanup temp files
+    ssh(`rm -f '${pyPath}' '${scriptPath}' '${outPath}' '${errPath}' 2>/dev/null`, 10);
+
+    const stdout = outR.stdout || '(no output)';
+    const stderr = errR.stdout || '';
+    const header = `Job ${jobId} ${state} (${((Date.now() - startTime) / 1000).toFixed(0)}s)`;
+
+    if (state !== 'COMPLETED') {
+      return { content: [{ type: 'text', text: `${header}\n\nstdout:\n${stdout}\n\nstderr:\n${stderr}` }], isError: true };
+    }
+
+    return { content: [{ type: 'text', text: stderr ? `${header}\n${stdout}\n[stderr]\n${stderr}` : `${header}\n${stdout}` }] };
   }
 
   // --- slurm_resubmit_failed ---
