@@ -101,6 +101,13 @@ function ensureConnection() {
   }
 }
 
+function rsyncSshOption() {
+  const base = `ssh -o BatchMode=yes -o ConnectTimeout=${SSH_TIMEOUT}`;
+  return NO_MULTIPLEX
+    ? `${base} -o ControlMaster=no -o ControlPath=none`
+    : `${base} -o ControlPath=${CONTROL_PATH} -o ControlMaster=auto`;
+}
+
 function ssh(remoteCmd, timeout = SSH_TIMEOUT) {
   ensureConnection();
   // Wrap in login shell so ~/.bashrc / /etc/profile.d are sourced (Slurm, conda, etc.)
@@ -402,6 +409,7 @@ const TOOLS = [
       properties: {
         code: { type: 'string', description: 'Python code to execute' },
         conda_env: { type: 'string', description: 'Conda environment to activate (default: jc_py311)' },
+        conda_sh: { type: 'string', description: 'Path to conda.sh to source (overrides MCP_CONDA_SH env; auto-discovered if omitted)' },
         partition: { type: 'string', description: 'Slurm partition (default: gpu31)' },
         working_dir: { type: 'string', description: 'Working directory for the script (default: home dir)' },
         timeout: { type: 'number', description: 'Max seconds to wait for job completion (default: 300)' },
@@ -630,7 +638,7 @@ print('OK')
 
     const rsyncArgs = [
       '-avz',
-      '-e', `ssh -o BatchMode=yes -o ConnectTimeout=${SSH_TIMEOUT} -o ControlPath=${CONTROL_PATH} -o ControlMaster=auto`
+      '-e', rsyncSshOption()
     ];
 
     if (args.dry_run) rsyncArgs.push('--dry-run');
@@ -677,7 +685,7 @@ print('OK')
 
     const rsyncArgs = [
       '-avz',
-      '-e', `ssh -o BatchMode=yes -o ConnectTimeout=${SSH_TIMEOUT} -o ControlPath=${CONTROL_PATH} -o ControlMaster=auto`
+      '-e', rsyncSshOption()
     ];
 
     if (args.dry_run) rsyncArgs.push('--dry-run');
@@ -818,8 +826,19 @@ print('OK')
     if (writeR.error || writeR.status !== 0)
       return { content: [{ type: 'text', text: `Error writing script: ${writeR.stderr || writeR.error}` }], isError: true };
 
-    // Build and write the Slurm wrapper script
+    // Build and write the Slurm wrapper script.
+    // Conda bootstrap: explicit arg > env var > auto-discovery via `command -v conda`.
+    // Falls back to failing fast inside the job if none can be found.
     const cdLine = workDir ? `cd '${safePath(workDir)}'` : '';
+    const condaSh = args.conda_sh || process.env.MCP_CONDA_SH || '';
+    const condaInit = condaSh
+      ? `source '${safePath(condaSh)}'`
+      : `if command -v conda >/dev/null 2>&1; then
+  source "$(conda info --base)/etc/profile.d/conda.sh"
+else
+  echo "run_python: could not locate conda; set conda_sh arg or MCP_CONDA_SH env" >&2
+  exit 127
+fi`;
     const slurmScript = `#!/bin/bash
 #SBATCH --job-name=mcp_py
 #SBATCH --output=${outPath}
@@ -828,7 +847,7 @@ print('OK')
 #SBATCH --time=${timeLimit}
 #SBATCH -p ${partition}
 ${cdLine}
-source /lustre/grp/zyjlab/linjc/miniconda3/etc/profile.d/conda.sh
+${condaInit}
 conda activate ${condaEnv}
 python3 '${pyPath}'
 `;
@@ -847,29 +866,40 @@ python3 '${pyPath}'
       return { content: [{ type: 'text', text: `Could not parse job ID: ${subR.stdout}` }], isError: true };
 
     // Poll until completion
+    const TERMINAL_STATES = ['COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY', 'NODE_FAIL'];
     const startTime = Date.now();
     let state = 'PENDING';
+    let reachedTerminal = false;
 
     while (Date.now() - startTime < maxWait * 1000) {
       const stateR = ssh(`sacct -j ${jobId} --format=State%20 --noheader --parsable2 2>&1 | head -1`, 15);
       if (stateR.stdout) {
         state = stateR.stdout.trim();
-        if (['COMPLETED', 'FAILED', 'CANCELLED', 'TIMEOUT', 'OUT_OF_MEMORY', 'NODE_FAIL'].includes(state)) break;
+        if (TERMINAL_STATES.includes(state)) { reachedTerminal = true; break; }
       }
       // Sleep via shell to avoid Node blocking issues
       spawnSync('sleep', ['3'], { timeout: 5000 });
     }
 
-    // Read output
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
+
+    // If the wait budget expired while the job is still pending/running, leave
+    // all temp artifacts in place so Slurm can finish consuming them and the
+    // user can inspect logs later. Return a live job handle.
+    if (!reachedTerminal) {
+      const header = `Job ${jobId} ${state || 'RUNNING'} (timeout after ${elapsed}s, still active)`;
+      const hint = `Artifacts preserved on ${HOST}:\n  script: ${scriptPath}\n  stdout: ${outPath}\n  stderr: ${errPath}\n  code:   ${pyPath}\nUse slurm_status / slurm_log / slurm_cancel to follow up.`;
+      return { content: [{ type: 'text', text: `${header}\n\n${hint}` }], isError: true };
+    }
+
+    // Terminal state reached — safe to read and clean up.
     const outR = ssh(`cat '${outPath}' 2>/dev/null`, 30);
     const errR = ssh(`cat '${errPath}' 2>/dev/null`, 30);
-
-    // Cleanup temp files
     ssh(`rm -f '${pyPath}' '${scriptPath}' '${outPath}' '${errPath}' 2>/dev/null`, 10);
 
     const stdout = outR.stdout || '(no output)';
     const stderr = errR.stdout || '';
-    const header = `Job ${jobId} ${state} (${((Date.now() - startTime) / 1000).toFixed(0)}s)`;
+    const header = `Job ${jobId} ${state} (${elapsed}s)`;
 
     if (state !== 'COMPLETED') {
       return { content: [{ type: 'text', text: `${header}\n\nstdout:\n${stdout}\n\nstderr:\n${stderr}` }], isError: true };
