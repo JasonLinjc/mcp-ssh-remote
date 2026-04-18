@@ -18,14 +18,22 @@ if (!HOST) {
 }
 
 // --- SSH ControlMaster multiplexing ---
+// Multiplexing is disabled by default because jump hosts that permit only one
+// session per TCP connection cause every follow-up call to fail with
+// "Session open refused by peer". Set MCP_SSH_MULTIPLEX=1 to re-enable it for
+// hosts where multiplexing actually works.
+const NO_MULTIPLEX = process.env.MCP_SSH_MULTIPLEX !== '1';
 const CONTROL_DIR = path.join(os.tmpdir(), 'mcp-ssh-remote');
 const CONTROL_PATH = path.join(CONTROL_DIR, `ctrl-${HOST}`);
 const SSH_TIMEOUT = 60;
 const LONG_TIMEOUT = 600; // 10 minutes for long-running commands
 
-try { fs.mkdirSync(CONTROL_DIR, { recursive: true, mode: 0o700 }); } catch {}
+if (!NO_MULTIPLEX) {
+  try { fs.mkdirSync(CONTROL_DIR, { recursive: true, mode: 0o700 }); } catch {}
+}
 
 function startControlMaster() {
+  if (NO_MULTIPLEX) return;
   // Check if a control socket already exists and is alive
   const check = spawnSync('ssh', ['-O', 'check', '-o', `ControlPath=${CONTROL_PATH}`, HOST],
     { encoding: 'utf8', timeout: 5000 });
@@ -53,6 +61,7 @@ function startControlMaster() {
 }
 
 function stopControlMaster() {
+  if (NO_MULTIPLEX) return;
   spawnSync('ssh', ['-O', 'exit', '-o', `ControlPath=${CONTROL_PATH}`, HOST],
     { encoding: 'utf8', timeout: 5000 });
 }
@@ -64,6 +73,15 @@ process.on('SIGINT', () => { stopControlMaster(); process.exit(0); });
 process.on('SIGTERM', () => { stopControlMaster(); process.exit(0); });
 
 function sshArgs() {
+  if (NO_MULTIPLEX) {
+    return [
+      '-o', 'BatchMode=yes',
+      '-o', `ConnectTimeout=${SSH_TIMEOUT}`,
+      '-o', 'ControlMaster=no',
+      '-o', 'ControlPath=none',
+      HOST
+    ];
+  }
   return [
     '-o', 'BatchMode=yes',
     '-o', `ConnectTimeout=${SSH_TIMEOUT}`,
@@ -74,6 +92,7 @@ function sshArgs() {
 }
 
 function ensureConnection() {
+  if (NO_MULTIPLEX) return;
   const check = spawnSync('ssh', ['-O', 'check', '-o', `ControlPath=${CONTROL_PATH}`, HOST],
     { encoding: 'utf8', timeout: 5000 });
   if (check.status !== 0) {
