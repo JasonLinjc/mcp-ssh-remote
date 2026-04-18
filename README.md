@@ -12,11 +12,33 @@ This server has no SSH implementation of its own — it calls the system `ssh` b
 
 ## Features
 
-- **SSH ControlMaster multiplexing** — opens one persistent connection on startup, all commands reuse it (no per-command bastion handshake overhead)
+- **Works with any `~/.ssh/config` setup** — ProxyCommand, ProxyJump, magic-user auto-forward bastions
+- **Optional SSH ControlMaster multiplexing** — opt in with `MCP_SSH_MULTIPLEX=1` for hosts where it works (off by default; see [SSH multiplexing](#ssh-multiplexing))
 - **Login shell wrapping** — commands run via `bash -l` so your full environment (conda, Slurm, modules) is always available
 - **Slurm integration** — submit, cancel, monitor jobs and read logs directly
 - **rsync support** — sync local directories to the remote server through the bastion
 - **Safe file operations** — large file writes piped via stdin (no shell arg limits), edit files with find-and-replace
+
+## SSH multiplexing
+
+Multiplexing is **off by default**. Many jump hosts — especially magic-user auto-forward bastions (e.g. `user/target_ip/target_user`) — permit only one session per TCP connection. Every follow-up call then fails with `Session open refused by peer`, leaks stderr into the response, and flakes under load.
+
+With multiplexing off, each call opens a fresh SSH connection. Slightly slower per call, but correct and reliable.
+
+For hosts where multiplexing works (plain direct SSH, standard ProxyJump over a jumphost that supports session forwarding), opt in via env var:
+
+```json
+{
+  "mcpServers": {
+    "ssh-remote": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/path/to/mcp-ssh-remote/index.js", "--host", "myserver"],
+      "env": {"MCP_SSH_MULTIPLEX": "1"}
+    }
+  }
+}
+```
 
 ## Requirements
 
